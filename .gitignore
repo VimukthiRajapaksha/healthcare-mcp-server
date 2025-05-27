@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.eggs/
+*.egg-info/
+*.egg
+
+# Environment variables
+.env
+*.env
+
+# IDE specific
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# Other
+.DS_Store
+build/
+dist/
+*.log
+*.log.*
+logs/
+*.log
+test-output/
+coverage.xml
+.coverage
+htmlcov/
+*.sqlite3
+db.sqlite3
+*.pid
+*.pid.lock
+celerybeat-schedule
+local_settings.py
+instance/
+*.swp
+*.swo
+*~
