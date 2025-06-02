@@ -20,10 +20,6 @@ from functools import lru_cache
 import logging
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s {%(name)s.%(funcName)s:%(lineno)d} - %(message)s",
-)
 
 
 def http_get(
@@ -52,7 +48,9 @@ def get_fhir_resource(
 @lru_cache(maxsize=128)
 def get_capability_statement(fhir_base_url: str) -> Dict[str, Any]:
     fhir_metadata_url: str = f"{fhir_base_url}/metadata?_format=json"
-    return get_fhir_resource(fhir_metadata_url)
+    return get_fhir_resource(
+        fhir_metadata_url, headers={"Accept": "application/fhir+json"}
+    )
 
 
 def trim_resource(operations: List[Dict[str, Any]]) -> List[Dict[str, Optional[str]]]:

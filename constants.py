@@ -14,10 +14,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import os
+# import os
 
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 
-load_dotenv()
+# load_dotenv()
 
-FHIR_BASE_URL: str = os.getenv("FHIR_BASE_URL", "https://hapi.fhir.org/baseR4")
+# FHIR_MCP_BASE_URL: str = os.getenv("FHIR_MCP_BASE_URL", "https://hapi.fhir.org/baseR4")
