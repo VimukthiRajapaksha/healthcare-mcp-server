@@ -33,9 +33,13 @@ This server allows you to search for FHIR (Fast Healthcare Interoperability Reso
     ```bash
     cp .env.example .env
     ```
-    Set `FHIR_BASE_URL` in your `.env` file.
 
 ## Usage
+
+Run the server:
+```bash
+uv run server.py
+```
 
 Run the server in the MCP Inspector mode:
 ```bash

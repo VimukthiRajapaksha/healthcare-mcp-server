@@ -20,39 +20,35 @@ from functools import lru_cache
 import logging
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s {%(name)s.%(funcName)s:%(lineno)d} - %(message)s",
-)
 
-
-def http_get(
+async def http_get(
     url: str, params: Optional[dict] = None, headers: Optional[dict] = None
 ) -> requests.Response:
     logger.info(f"http_get called with url='{url}', params={params}, headers={headers}")
 
-    response = requests.get(url, params=params, headers=headers)
+    response = requests.get(url, params=params, headers=headers, timeout=30)
     logger.info(f"http_get received response with status code: {response.status_code}")
     return response
 
 
-def get_fhir_resource(
+async def get_fhir_resource(
     fhir_url: str, params: Optional[dict] = None, headers: Optional[dict] = None
 ) -> Dict[str, Any]:
-    logger.info(
-        f"get_fhir_resource called with fhir_url='{fhir_url}' and params={params}"
+    logger.debug(
+        f"get_fhir_resource called with fhir_url='{fhir_url}',  params={params}, and headers={headers}"
     )
 
-    response = http_get(fhir_url, params, headers)
+    response = await http_get(fhir_url, params, headers)
     response.raise_for_status()
-    logger.info("get_fhir_resource successfully fetched capabilitystatement.")
+    logger.info(f"Successfully fetched data from fhir_url={fhir_url}")
     return response.json()
 
 
 @lru_cache(maxsize=128)
-def get_capability_statement(fhir_base_url: str) -> Dict[str, Any]:
-    fhir_metadata_url: str = f"{fhir_base_url}/metadata?_format=json"
-    return get_fhir_resource(fhir_metadata_url)
+async def get_capability_statement(metadata_url: str) -> Dict[str, Any]:
+    capability_statement: Dict[str, Any] = await get_fhir_resource(metadata_url)
+    logger.info("Successfully fetched capabilitystatement.")
+    return capability_statement
 
 
 def trim_resource(operations: List[Dict[str, Any]]) -> List[Dict[str, Optional[str]]]:
