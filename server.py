@@ -25,6 +25,7 @@ import logging
 
 from fhir_utils import (
     create_async_fhir_client,
+    get_operation_outcome_error,
     get_operation_outcome_exception,
     get_operation_outcome_required_error,
 )
@@ -238,6 +239,10 @@ async def get_capabilities(type: str) -> Dict[str, Any]:
                     "operation": trim_resource(resource.get("operation", [])),
                 }
         logger.info(f"Resource type '{type}' not found in the CapabilityStatement.")
+        return await get_operation_outcome_error(
+            code="not-supported",
+            diagnostics=f"The interaction, operation, resource or profile {type} is not supported.",
+        )
     except Exception as ex:
         logger.exception(
             f"Error while executing the FHIR metadata interaction for resource_type '{type}'. Caused by, ",
@@ -393,7 +398,7 @@ async def create(
 
 
 @mcp.tool()
-async def patch(
+async def update(
     type: str,
     id: str,
     payload: Dict[str, Any],
@@ -401,17 +406,19 @@ async def patch(
     operation: Optional[str] = "",
 ) -> Dict[str, Any]:
     """
-    Applies a FHIR "patch" interaction to modify an existing resource by ID, using an RFC 6902 JSON-patch payload.
+    Performs a FHIR "update" interaction by replacing an existing resource instance's content with the provided payload.
 
-    Use it when you need to update parts of a resource without resending the entire body. Do not use this for creating resources,
-    and ensure your payload conforms to the server's patch profile and that you have the latest version to avoid version conflicts.
+    Use it when you need to overwrite a resource's data in its entirety, such as correcting or completing a record, and you already know the resource's logical id.
+    Optionally, you can include searchParam for conditional updates (e.g., only update if the resource matches certain criteria) or specify a
+    custom operation (e.g., "$validate" to run validation before updating). The tool returns the updated resource or an OperationOutcome detailing any errors.
 
     Args:
         type (str): The FHIR resource type name (e.g., "Location", "Organization", "Coverage").
         id (str): The logical ID of a specific FHIR resource instance.
                 Must exactly match one of the core or profile-defined resource types supported by the server.
-        payload (Dict[str, str]): A JSON object following the RFC 6902 patch syntax (an array of operations) of the FHIR resource to be patched
-                (e.g., [{"op": "replace", "path": "/name/family", "value": "Doe"}]).
+        payload (Dict[str, Any]): The complete JSON representation of the FHIR resource, containing all required elements and any optional data.
+                Servers replace the existing resource with this exact content, so the payload must include all mandatory fields defined by the resource's profile
+                and any previous data you wish to preserve.
         searchParam (Dict[str, str]): A mapping of FHIR search parameter names to their desired values (e.g., {"patient":"Patient/54321","relationship":"father"}).
                 These parameters refine queries for operation-specific query qualifiers.
                 Only parameters exposed by `get_capabilities` for that resource type are valid.
@@ -432,9 +439,11 @@ async def patch(
             return await get_operation_outcome_required_error("type")
 
         client: AsyncFHIRClient = await get_async_fhir_client()
-        client.extra_headers = {"Content-Type": "application/json-patch+json"}
         bundle: dict = await client.resource(resource_type=type, id=id).execute(
-            operation=operation or "", method="PATCH", data=payload, params=searchParam
+            operation=operation or "",
+            method="PUT",
+            data={id: id, **payload},
+            params=searchParam,
         )
         return await get_bundle_entries(bundle=bundle)
     except OperationOutcome as ex:
