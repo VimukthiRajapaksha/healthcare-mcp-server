@@ -16,7 +16,7 @@
 
 import requests
 from typing import List, Dict, Any, Optional
-from functools import lru_cache
+#from functools import lru_cache
 import logging
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ async def get_fhir_resource(
     return response.json()
 
 
-@lru_cache(maxsize=128)
+#@lru_cache(maxsize=128)
 async def get_capability_statement(metadata_url: str) -> Dict[str, Any]:
     capability_statement: Dict[str, Any] = await get_fhir_resource(metadata_url)
     logger.info("Successfully fetched capabilitystatement.")

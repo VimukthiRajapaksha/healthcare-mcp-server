@@ -15,15 +15,24 @@
 # under the License.
 
 import click
+from fhirpy import AsyncFHIRClient
+from fhirpy.lib import AsyncFHIRResource
+from fhirpy.base.exceptions import OperationOutcome
+from fhirpy.base.searchset import Raw
 from mcp.server.fastmcp import FastMCP
 
 import logging
 
+from fhir_utils import (
+    create_async_fhir_client,
+    get_operation_outcome_exception,
+    get_operation_outcome_required_error,
+)
 from oauth.client_provider import FHIRClientProvider
 from oauth.common import handle_failed_authentication, handle_successful_authentication
 from oauth.server_provider import OAuthServerProvider
 from oauth.types import OAuthToken, ServerConfigs, TokenStorage
-from utils import get_capability_statement, get_fhir_resource, trim_resource
+from utils import get_capability_statement, trim_resource
 from typing import Dict, Any, Literal, Optional
 
 from pydantic import AnyHttpUrl
@@ -93,7 +102,7 @@ client_provider: FHIRClientProvider = FHIRClientProvider(
 
 
 @mcp.custom_route("/fhir/callback", methods=["GET"])
-async def oauth_callback(request: Request) -> HTMLResponse:
+async def handle_fhir_server_callback(request: Request) -> HTMLResponse:
     """Handle FHIR OAuth redirect."""
     code: str | None = request.query_params.get("code")
     state: str | None = request.query_params.get("state")
@@ -113,7 +122,7 @@ async def oauth_callback(request: Request) -> HTMLResponse:
 
 
 @mcp.custom_route("/oauth/callback", methods=["GET"])
-async def redirect_handler(request: Request) -> Response:
+async def handle_auth_server_callback(request: Request) -> Response:
     """Handle MCP OAuth redirect."""
     code: str | None = request.query_params.get("code")
     state: str | None = request.query_params.get("state")
@@ -131,7 +140,7 @@ async def redirect_handler(request: Request) -> Response:
         return handle_failed_authentication("Something went wrong.")
 
 
-def get_mcp_client_token() -> str:
+async def get_client_access_token() -> str:
     """Get the access token for the authenticated client."""
     access_token = get_access_token()
     if not access_token:
@@ -146,27 +155,76 @@ def get_mcp_client_token() -> str:
     return access_token
 
 
-@mcp.tool()
-async def get_available_resource_types(type: str) -> Dict[str, Any]:
-    """
-    Retrieves the valid search parameters and available operations for a specified FHIR resource type.
+async def get_user_access_token() -> OAuthToken | None:
+    """Get the access token for the authenticated user."""
+    client_access_token: str = await get_client_access_token()
+    user_access_token: OAuthToken | None = await client_provider.get_access_token(
+        client_access_token
+    )
 
-    Use this tool before attempting any `search_fhir` calls whenever you need to discover or validate which `searchParam` keys
-    and `operation` values are allowed. It will not perform any searches itself or return resource instances, only metadata
-    about what search inputs are available.
+    if not user_access_token:
+        # Wait for user_access_token to become available, with a timeout
+        for _ in range(30):  # Try for up to 30 seconds
+            user_access_token: OAuthToken | None = client_provider.storage.get_token(
+                client_access_token
+            )
+            if user_access_token:
+                break
+            await asyncio.sleep(1)
+        if not user_access_token:
+            logger.error("Failed to obtain user access token.")
+    return user_access_token
+
+
+async def get_bundle_entries(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    if "entry" in bundle and isinstance(bundle["entry"], list):
+        logger.debug(f"found {len(bundle['entry'])} entries for type '{type}'")
+        return {
+            "entry": [
+                entry.get("resource")
+                for entry in bundle["entry"]
+                if "resource" in entry
+            ]
+        }
+    return bundle
+
+
+async def get_async_fhir_client() -> AsyncFHIRClient:
+
+    user_token: OAuthToken | None = await get_user_access_token()
+    if not user_token:
+        raise ValueError("User is not authenticated")
+
+    return await create_async_fhir_client(
+        config=server_configs.fhir, access_token=user_token.access_token
+    )
+
+
+@mcp.tool()
+async def get_capabilities(type: str) -> Dict[str, Any]:
+    """
+    Retrieves metadata about a specified FHIR resource type, including its supported search parameters and custom operations.
+
+    This tool should be used at the start of any workflow where you need to discover what queries or operations are permitted
+    against that resource (e.g., before calling search, read, or create). Do not use this tool to fetch actual resources.
+    It only returns definitions and descriptions of capabilities, not resource instances. Because FHIR defines different search
+    parameters and operations per resource type, this tool ensures your subsequent calls use valid inputs.
 
     Args:
-        type (str): The type of core FHIR resource (e.g., "Patient", "Observation", "Encounter").
+        type (str): The FHIR resource type name (e.g., "Patient", "Observation", "Encounter").
+                Must exactly match one of the core or profile-defined resource types supported by the server.
 
     Returns:
         Dict[str, Any]:
             A dictionary containing:
-            - "type": the requested resource type (if available).
-            - "searchParam": a Dict[str, str] of searchable parameter names to their descriptions for that resource type.
-            - "operation": a Dict[str, str] of supported custom operation names to their descriptions.
+            - "type" (str): The requested resource type (if available) or empty.
+            - "searchParam" (Dict[str, str]): A map of FHIR search-parameter names. Each key is the parameter name
+                    (e.g., "family", "_id", "_lastUpdated"), and each value is the FHIR-provided description of that parameter's meaning and usage constraints.
+            - "operation" (Dict[str, str]): A map of custom FHIR operation names to their descriptions.
+                    Each key is the operation name (e.g., "$validate"), and each value explains the operation's purpose.
     """
 
-    logger.info(f"Tool get_available_resources called with resource_type='{type}'")
+    logger.debug(f"Invoked with resource_type='{type}'")
     try:
         data: Dict[str, Any] = await get_capability_statement(
             server_configs.fhir.metadata_url
@@ -180,98 +238,275 @@ async def get_available_resource_types(type: str) -> Dict[str, Any]:
                     "operation": trim_resource(resource.get("operation", [])),
                 }
         logger.info(f"Resource type '{type}' not found in the CapabilityStatement.")
-    except Exception as e:
+    except Exception as ex:
         logger.exception(
-            f"Error while parsing the CapabilityStatement for resource_type '{type}': {e}"
+            f"Error while executing the FHIR metadata interaction for resource_type '{type}'. Caused by, ",
+            exc_info=ex,
         )
-    return {}
+    return await get_operation_outcome_exception()
 
 
 @mcp.tool()
-async def search_fhir(
-    type: str,
-    searchParam: Optional[Dict[str, str]] = None,
-    operation: Optional[str] = None,
-) -> Dict[str, Any]:
+async def search(
+    type: str, searchParam: Dict[str, str]
+) -> list[AsyncFHIRResource] | Dict[str, Any]:
     """
-    Execute a FHIR search or custom operation on a given resource type.
+    Executes a standard FHIR search interaction on a given resource type, returning a bundle or list of matching resources.
 
-    Use this function only after retrieving valid `searchParam` and/or `operation`
-    values from `get_available_resource_types`. It returns the raw FHIR bundle
-    or the result of the specified operation. Do not call search_fhir directly without
-    first retrieving and selecting valid parameters via get_available_resource_types.
+    Use this when you need to query for multiple resources based on one or more search-parameters.
+    Do not use this tool for create, update, or delete operations, and be aware that large result sets may be paginated by the FHIR server.
 
     Args:
-        type (str): The FHIR resource type to query (e.g., "Patient").
-        searchParam (Optional[Dict[str, str]]): A mapping of one or more search parameter names to values,
-            as returned by `get_available_resource_types`.
-        operation (Optional[str]): The name of a custom FHIR operation (e.g., "$validate"),
-            as returned by `get_available_resource_types`.
+        type (str): The FHIR resource type name (e.g., "MedicationRequest", "Condition", "Procedure").
+                Must exactly match one of the core or profile-defined resource types supported by the server.
+        searchParam (Dict[str, str]): A mapping of FHIR search parameter names to their desired values (e.g., {"family":"Smith","birthdate":"1970-01-01"}).
+                These parameters refine queries for operation-specific query qualifiers.
+                Only parameters exposed by `get_capabilities` for that resource type are valid.
 
     Returns:
-        Dict[str, Any]: A dictionary containing the FHIR search result bundle or operation output.
+        Dict[str, Any]: A dictionary containing the full FHIR resource instance matching the search criteria.
     """
 
-    logger.info(
-        f"Tool search_fhir called with type='{type}', searchParam={searchParam}, operation={operation}"
-    )
+    logger.debug(f"Invoked with type='{type}' and searchParam={searchParam}")
 
-    client_access_token: str = get_mcp_client_token()
-    user_access_token: OAuthToken | None = await client_provider.get_access_token(
-        client_access_token
+    try:
+        if not type:
+            logger.error("Unable to perform search: 'type' is a mandatory field.")
+            return await get_operation_outcome_required_error("type")
+
+        client: AsyncFHIRClient = await get_async_fhir_client()
+        return await client.resources(type).search(Raw(**searchParam)).fetch()
+    except Exception as ex:
+        logger.exception(
+            f"Error while executing the FHIR search interaction for resource_type '{type}'. Caused by, ",
+            exc_info=ex,
+        )
+    return await get_operation_outcome_exception()
+
+
+@mcp.tool()
+async def read(
+    type: str,
+    id: str,
+    searchParam: Optional[Dict[str, str]] = None,
+    operation: Optional[str] = "",
+) -> Dict[str, Any]:
+    """
+    Performs a FHIR "read" interaction to retrieve a single resource instance by its type and resource ID,
+    optionally refining the response with search parameters or custom operations.
+
+    Use it when you know the exact resource ID and require that one resource; do not use it for bulk queries.
+    If additional query-level parameters or operations are needed (e.g., _elements or $validate), include them in searchParam or operation.
+
+    Args:
+        type (str): The FHIR resource type name (e.g., "DiagnosticReport", "AllergyIntolerance", "Immunization").
+                Must exactly match one of the core or profile-defined resource types supported by the server.
+        id (str): The logical ID of a specific FHIR resource instance.
+        searchParam (Dict[str, str]): A mapping of FHIR search parameter names to their desired values (e.g., {"device-name":"glucometer"}).
+                These parameters refine queries for operation-specific query qualifiers.
+                Only parameters exposed by `get_capabilities` for that resource type are valid.
+        operation (Optional[str]): The name of a custom FHIR operation or extended query defined for the resource (e.g., "$everything").
+                Must match one of the operation names returned by `get_capabilities`.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing the single FHIR resource instance of the requested type and id.
+    """
+
+    logger.debug(
+        f"Invoked with type='{type}', id={id}, searchParam={searchParam}, and operation={operation}"
     )
 
     try:
         if not type:
-            logger.error("search_fhir failed: 'type' is a mandatory field.")
-            return {"error": "type is a mandatory field"}
+            logger.error("Unable to perform read: 'type' is a mandatory field.")
+            return await get_operation_outcome_required_error("type")
 
-        if not user_access_token:
-            # Wait for user_access_token to become available, with a timeout
-            for _ in range(30):  # Try for up to 30 seconds
-                user_access_token: OAuthToken | None = (
-                    client_provider.storage.get_token(client_access_token)
-                )
-                if user_access_token:
-                    break
-                await asyncio.sleep(1)
-            if not user_access_token:
-                logger.error("Failed to obtain user access token.")
-                return {"error": "Failed to obtain user access token"}
-
-        fhir_resource_url: str = f"{server_configs.fhir.base_url.rstrip('/')}/{type}"
-        if operation:
-            operation = operation if operation.startswith("$") else f"${operation}"
-            fhir_resource_url: str = f"{fhir_resource_url}/{operation}"
-        params: Optional[Dict[str, str]] = searchParam if searchParam else None
-
-        data: Dict[str, Any] = await get_fhir_resource(
-            fhir_resource_url,
-            params=params,
-            headers={"Authorization": f"Bearer {user_access_token.access_token}"},
+        client: AsyncFHIRClient = await get_async_fhir_client()
+        bundle: dict = await client.resource(resource_type=type, id=id).execute(
+            operation=operation or "", method="GET", params=searchParam
         )
 
-        if "entry" in data and isinstance(data["entry"], list):
-            logger.info(
-                f"search_fhir found {len(data['entry'])} entries for type '{type}'"
-            )
-            return {
-                "entry": [
-                    entry.get("resource")
-                    for entry in data["entry"]
-                    if "resource" in entry
-                ]
-            }
-
-        logger.info(
-            f"search_fhir: No 'entry' array found in response for type '{type}'"
-        )
-        return data
-    except Exception as e:
+        return await get_bundle_entries(bundle=bundle)
+    except Exception as ex:
         logger.exception(
-            f"Error while parsing fhir search request for resource_type '{type}': {e}"
+            f"Error while executing the FHIR read interaction for resource_type '{type}'. Caused by, ",
+            exc_info=ex,
         )
-    return {}
+    return await get_operation_outcome_exception()
+
+
+@mcp.tool()
+async def create(
+    type: str,
+    payload: Dict[str, Any],
+    searchParam: Optional[Dict[str, str]] = None,
+    operation: Optional[str] = "",
+) -> Dict[str, Any]:
+    """
+    Executes a FHIR "create" interaction to persist a new resource of the specified type. It is required to supply the full resource payload in JSON form.
+
+    Use this tool when you need to add new data (e.g., a new Patient or Observation). Do not call it to update existing resources; for updates, use patch.
+    Note that servers may reject resources that violate profiles or mandatory bindings.
+
+    Args:
+        type (str): The FHIR resource type name (e.g., "Device", "CarePlan", "Goal").
+                Must exactly match one of the core or profile-defined resource types supported by the server.
+        payload (Dict[str, str]): A JSON object representing the full FHIR resource body to be created.
+                It must include all required elements of the resource's profile.
+        searchParam (Dict[str, str]): A mapping of FHIR search parameter names to their desired values (e.g., {"address-city":"Boston"}).
+                These parameters refine queries for operation-specific query qualifiers.
+                Only parameters exposed by `get_capabilities` for that resource type are valid.
+        operation (Optional[str]): The name of a custom FHIR operation or extended query defined for the resource (e.g., "$evaluate").
+                Must match one of the operation names returned by `get_capabilities`.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing the newly created FHIR resource, including server-assigned fields (id, meta.versionId, meta.lastUpdated,
+                and any server-added extensions). Reflects exactly what was persisted.
+    """
+
+    logger.debug(
+        f"Invoked with type='{type}', payload={payload}, searchParam={searchParam}, and operation={operation}"
+    )
+
+    try:
+        if not type:
+            logger.error("Unable to perform create: 'type' is a mandatory field.")
+            return await get_operation_outcome_required_error("type")
+
+        client: AsyncFHIRClient = await get_async_fhir_client()
+        bundle: dict = await client.resource(resource_type=type).execute(
+            operation=operation or "", data=payload, params=searchParam
+        )
+
+        return await get_bundle_entries(bundle=bundle)
+    except OperationOutcome as ex:
+        logger.exception(
+            f"Error while creating the FHIR resource:'{type}', Caused by,", exc_info=ex
+        )
+        return ex.resource["issue"] or await get_operation_outcome_exception()
+    except Exception as ex:
+        logger.exception(
+            f"Error while executing the FHIR create interaction for resource_type '{type}'. Caused by, ",
+            exc_info=ex,
+        )
+    return await get_operation_outcome_exception()
+
+
+@mcp.tool()
+async def patch(
+    type: str,
+    id: str,
+    payload: Dict[str, Any],
+    searchParam: Optional[Dict[str, str]] = None,
+    operation: Optional[str] = "",
+) -> Dict[str, Any]:
+    """
+    Applies a FHIR "patch" interaction to modify an existing resource by ID, using an RFC 6902 JSON-patch payload.
+
+    Use it when you need to update parts of a resource without resending the entire body. Do not use this for creating resources,
+    and ensure your payload conforms to the server's patch profile and that you have the latest version to avoid version conflicts.
+
+    Args:
+        type (str): The FHIR resource type name (e.g., "Location", "Organization", "Coverage").
+        id (str): The logical ID of a specific FHIR resource instance.
+                Must exactly match one of the core or profile-defined resource types supported by the server.
+        payload (Dict[str, str]): A JSON object following the RFC 6902 patch syntax (an array of operations) of the FHIR resource to be patched
+                (e.g., [{"op": "replace", "path": "/name/family", "value": "Doe"}]).
+        searchParam (Dict[str, str]): A mapping of FHIR search parameter names to their desired values (e.g., {"patient":"Patient/54321","relationship":"father"}).
+                These parameters refine queries for operation-specific query qualifiers.
+                Only parameters exposed by `get_capabilities` for that resource type are valid.
+        operation (Optional[str]): The name of a custom FHIR operation or extended query defined for the resource (e.g., "$lastn").
+                Must match one of the operation names returned by `get_capabilities`.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing the updated FHIR resource after applying the JSON Patch operations..
+    """
+
+    logger.debug(
+        f"Invoked with type='{type}', id={id}, payload={payload}, searchParam={searchParam}, and operation={operation}"
+    )
+
+    try:
+        if not type:
+            logger.error("Unable to perform create: 'type' is a mandatory field.")
+            return await get_operation_outcome_required_error("type")
+
+        client: AsyncFHIRClient = await get_async_fhir_client()
+        client.extra_headers = {"Content-Type": "application/json-patch+json"}
+        bundle: dict = await client.resource(resource_type=type, id=id).execute(
+            operation=operation or "", method="PATCH", data=payload, params=searchParam
+        )
+        return await get_bundle_entries(bundle=bundle)
+    except OperationOutcome as ex:
+        logger.exception(
+            f"Error while patching the FHIR resource:'{type}', Caused by,", exc_info=ex
+        )
+        return ex.resource["issue"] or await get_operation_outcome_exception()
+    except Exception as ex:
+        logger.exception(
+            f"Error while executing the FHIR patch interaction for resource_type '{type}'. Caused by, ",
+            exc_info=ex,
+        )
+    return await get_operation_outcome_exception()
+
+
+@mcp.tool()
+async def delete(
+    type: str,
+    id: Optional[str] = "",
+    searchParam: Optional[Dict[str, str]] = None,
+    operation: Optional[str] = "",
+) -> Dict[str, Any]:
+    """
+    Execute a FHIR "delete" interaction on a specific resource instance.
+
+    Use this tool when you need to remove a single resource identified by its logical ID or optionally filtered by search parameters.
+    The optional `id` parameter must match an existing resource instance when present. If you include `searchParam`,
+    the server will perform a conditional delete, deleting the resource only if it matches the given criteria. If you supply `operation`,
+    it will execute the named FHIR operation (e.g., `$expunge`) on the resource. Do not use this tool for bulk deletes across multiple
+    This tool returns a FHIR `OperationOutcome` describing success or failure of the deletion.
+
+    Args:
+        type (str): The FHIR resource type name (e.g., "ServiceRequest", "Appointment", "HealthcareService").
+        id (str): The logical ID of a specific FHIR resource instance.
+                Must exactly match one of the core or profile-defined resource types supported by the server.
+        payload (Dict[str, str]): A JSON object following the RFC 6902 patch syntax (an array of operations) of the FHIR resource to be patched
+                (e.g., [{"op": "replace", "path": "/name/family", "value": "Doe"}]).
+        searchParam (Dict[str, str]): A mapping of FHIR search parameter names to their desired values (e.g., {"category":"laboratory","issued:"2025-05-01"}).
+                These parameters refine queries for operation-specific query qualifiers.
+                Only parameters exposed by `get_capabilities` for that resource type are valid.
+        operation (Optional[str]): The name of a custom FHIR operation or extended query defined for the resource (e.g., "$expand").
+                Must match one of the operation names returned by `get_capabilities`.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing the confirmation of deletion or details on why deletion failed.
+    """
+
+    logger.debug(
+        f"Invoked with type='{type}', id={id}, searchParam={searchParam}, and operation={operation}"
+    )
+
+    try:
+        if not type:
+            logger.error("Unable to perform create: 'type' is a mandatory field.")
+            return await get_operation_outcome_required_error("type")
+
+        client: AsyncFHIRClient = await get_async_fhir_client()
+        bundle: dict = await client.resource(resource_type=type, id=id).execute(
+            operation=operation or "", method="DELETE", params=searchParam
+        )
+        return await get_bundle_entries(bundle=bundle)
+    except OperationOutcome as ex:
+        logger.exception(
+            f"Error while deleting the FHIR resource:'{type}', Caused by,", exc_info=ex
+        )
+        return ex.resource["issue"] or await get_operation_outcome_exception()
+    except Exception as ex:
+        logger.exception(
+            f"Error while executing the FHIR delete interaction for resource_type '{type}'. Caused by, ",
+            exc_info=ex,
+        )
+    return await get_operation_outcome_exception()
 
 
 @click.command()

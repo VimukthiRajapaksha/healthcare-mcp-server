@@ -46,6 +46,7 @@ class MCPOAuthConfigs(BaseOAuthConfigs):
 
 class FHIROAuthConfigs(BaseOAuthConfigs):
     base_url: str
+    timeout: int = 30
 
     def callback_url(
         self, server_url: str, suffix: str = "/fhir/callback"
