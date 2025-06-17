@@ -14,9 +14,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from typing import Dict
-from oauth.types import OAuthMetadata
-from mcp.shared._httpx_utils import create_mcp_http_client
+
 import logging
 import time
 import secrets
@@ -24,14 +22,19 @@ import string
 import hashlib
 import base64
 
-from starlette.responses import HTMLResponse
+from typing import Dict
+from httpx import Response
 
+
+from oauth.types import OAuthMetadata, OAuthToken
+from mcp.shared._httpx_utils import create_mcp_http_client
+from starlette.responses import HTMLResponse
 
 logger = logging.getLogger(__name__)
 
 
 async def discover_oauth_metadata(
-    metadata_url: str, headers: Dict[str, str]
+    metadata_url: str, headers: Dict[str, str] = {"Accept": "application/fhir+json"}
 ) -> OAuthMetadata | None:
     """
     Discover OAuth metadata from server's well-known endpoint.
@@ -72,7 +75,7 @@ def handle_successful_authentication() -> HTMLResponse:
         <!DOCTYPE html>
         <html>
             <head>
-                <title>Authentication Success</title>
+                <title>FHIR MCP Server | Authentication Complete</title>
             </head>
             <body style="font-family:Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#F5F5F5;">
                 <div style="text-align:center;padding:20px;background:#E5F5E0;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);width:400px;">
@@ -92,7 +95,7 @@ def handle_failed_authentication(error_desc: str = "") -> HTMLResponse:
         <!DOCTYPE html>
         <html>
             <head>
-                <title>Authentication Failed</title>
+                <title>FHIR MCP Server | Authentication Complete</title>
             </head>
             <body style="font-family:Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#F5F5F5;">
             <div style="text-align:center;padding:20px;background:#F7C6C7;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);width:400px;">
@@ -120,3 +123,43 @@ def generate_code_challenge(code_verifier: str) -> str:
     digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
     challenge = base64.urlsafe_b64encode(digest).decode("ascii")
     return challenge.rstrip("=")
+
+
+async def perform_token_flow(
+    url: str,
+    data: Dict[str, str],
+    headers: Dict[str, str] = {"Content-Type": "application/x-www-form-urlencoded"},
+    timeout: float = 30.0,
+) -> OAuthToken:
+    try:
+        async with create_mcp_http_client() as client:
+            response: Response = await client.post(
+                url=url,
+                data=data,
+                headers=headers,
+                timeout=timeout,
+            )
+
+            if response.status_code != 200:
+                logger.error(
+                    f"Token call failed with status: {response.status_code}: {response.text}"
+                )
+                raise ValueError(f"Token endpoint call failed")
+
+            # Parse token response
+            token_response: OAuthToken = OAuthToken.model_validate(response.json())
+
+            # Calculate token expiry
+            if not token_response.expires_at:
+                if token_response.expires_in:
+                    token_response.expires_at = time.time() + token_response.expires_in
+                else:
+                    token_response.expires_at = time.time() + 3600
+
+            return token_response
+
+    except Exception as ex:
+        logger.exception(
+            "Unable to invoke the token endpoint. Caused by, ", exc_info=ex
+        )
+        raise ValueError("Token endpoint call failed")

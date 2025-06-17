@@ -14,41 +14,47 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import requests
-from typing import List, Dict, Any, Optional
-#from functools import lru_cache
+import aiohttp
 import logging
 
-logger = logging.getLogger(__name__)
+from typing import Any, Dict, List, Optional
+from fhirpy import AsyncFHIRClient
 
-async def http_get(
-    url: str, params: Optional[dict] = None, headers: Optional[dict] = None
-) -> requests.Response:
-    logger.info(f"http_get called with url='{url}', params={params}, headers={headers}")
+from mcp.shared._httpx_utils import create_mcp_http_client
+from oauth.types import FHIROAuthConfigs
 
-    response = requests.get(url, params=params, headers=headers, timeout=30)
-    logger.info(f"http_get received response with status code: {response.status_code}")
-    return response
+logger: logging.Logger = logging.getLogger(__name__)
 
 
-async def get_fhir_resource(
-    fhir_url: str, params: Optional[dict] = None, headers: Optional[dict] = None
-) -> Dict[str, Any]:
-    logger.debug(
-        f"get_fhir_resource called with fhir_url='{fhir_url}',  params={params}, and headers={headers}"
+async def create_async_fhir_client(
+    config: FHIROAuthConfigs,
+    access_token: str,
+    extra_headers: dict | None = None,
+) -> AsyncFHIRClient:
+    """Create a FHIR AsyncClient with defaults."""
+
+    client: AsyncFHIRClient = AsyncFHIRClient(
+        url=config.base_url,
+        authorization=f"Bearer {access_token}",
+        aiohttp_config={
+            "timeout": aiohttp.ClientTimeout(total=config.timeout),
+        },
+        extra_headers=extra_headers,
     )
-
-    response = await http_get(fhir_url, params, headers)
-    response.raise_for_status()
-    logger.info(f"Successfully fetched data from fhir_url={fhir_url}")
-    return response.json()
+    return client
 
 
-#@lru_cache(maxsize=128)
-async def get_capability_statement(metadata_url: str) -> Dict[str, Any]:
-    capability_statement: Dict[str, Any] = await get_fhir_resource(metadata_url)
-    logger.info("Successfully fetched capabilitystatement.")
-    return capability_statement
+async def get_bundle_entries(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    if "entry" in bundle and isinstance(bundle["entry"], list):
+        logger.debug(f"found {len(bundle['entry'])} entries for type '{type}'")
+        return {
+            "entry": [
+                entry.get("resource")
+                for entry in bundle["entry"]
+                if "resource" in entry
+            ]
+        }
+    return bundle
 
 
 def trim_resource(operations: List[Dict[str, Any]]) -> List[Dict[str, Optional[str]]]:
@@ -60,3 +66,48 @@ def trim_resource(operations: List[Dict[str, Any]]) -> List[Dict[str, Optional[s
     ]
     logger.debug(f"trim_resource returning {len(trimmed)} trimmed operations.")
     return trimmed
+
+
+async def get_operation_outcome_exception() -> dict:
+    return await get_operation_outcome_error(
+        code="exception", diagnostics="An unexpected internal error has occurred."
+    )
+
+
+async def get_operation_outcome_required_error(element: str = "") -> dict:
+    return await get_operation_outcome_error(
+        code="required", diagnostics=f"A required element {element} is missing."
+    )
+
+
+async def get_operation_outcome_error(code: str, diagnostics: str) -> dict:
+    return {
+        "resourceType": "OperationOutcome",
+        "issue": [
+            {
+                "severity": "error",
+                "code": code,
+                "diagnostics": diagnostics,
+            }
+        ],
+    }
+
+
+async def get_capability_statement(metadata_url: str) -> Dict[str, Any]:
+    """
+    Discover CapabilityStatement from server's metadata endpoint.
+    """
+    try:
+        async with create_mcp_http_client() as client:
+            response = await client.get(
+                url=metadata_url, headers={"Accept": "application/fhir+json"}
+            )
+            response.raise_for_status()
+            metadata_json = response.json()
+            logger.debug(f"OAuth metadata discovered: {metadata_json}")
+            return metadata_json
+    except Exception as ex:
+        logger.exception(
+            "Unable to invoke the FHIR metadata endpoint. Caused by, ", exc_info=ex
+        )
+        raise ValueError("Unable to fetch FHIR metadata")

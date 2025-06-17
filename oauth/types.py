@@ -14,25 +14,21 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from typing import Dict
 from pydantic import AnyHttpUrl, BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from mcp.shared.auth import OAuthClientInformationFull
 
 
 class BaseOAuthConfigs(BaseSettings):
     client_id: str
     client_secret: str
-    scopes: str
+    scope: str
 
     @property
-    def scopes_list(self) -> list[str]:
-        # If the raw value is a string, split on commas
-        if isinstance(self.scopes, str):
-            return [
-                scopes.strip() for scopes in self.scopes.split(" ") if scopes.strip()
-            ]
-        return [self.scopes]
+    def scopes(self) -> list[str]:
+        # If the raw value is a string, split on empty spaces
+        if isinstance(self.scope, str):
+            return [scope.strip() for scope in self.scope.split(" ") if scope.strip()]
+        return [self.scope]
 
 
 class MCPOAuthConfigs(BaseOAuthConfigs):
@@ -46,7 +42,7 @@ class MCPOAuthConfigs(BaseOAuthConfigs):
 
 class FHIROAuthConfigs(BaseOAuthConfigs):
     base_url: str
-    timeout: int = 30
+    timeout: int = 30  # in secs
 
     def callback_url(
         self, server_url: str, suffix: str = "/fhir/callback"
@@ -128,39 +124,17 @@ class OAuthToken(BaseModel):
     refresh_token: str | None = None
     expires_at: float | None = None
 
+    @property
+    def scopes(self) -> list[str]:
+        return self.scope.split(" ") if self.scope else []
 
-class TokenStorage:
-    """In memory token storage."""
 
-    _tokens: Dict[str, OAuthToken] | None
-    _client_info: OAuthClientInformationFull | None
-
-    def __init__(
-        self,
-        tokens: Dict[str, OAuthToken] | None = None,
-        client_info: OAuthClientInformationFull | None = None,
-    ):
-        self._tokens: Dict[str, OAuthToken] | None = tokens
-        self._client_info: OAuthClientInformationFull | None = client_info
-
-    def get_tokens(self) -> Dict[str, OAuthToken] | None:
-        return self._tokens
-
-    def get_token(self, token_id: str) -> OAuthToken | None:
-        if self._tokens:
-            return self._tokens.get(token_id)
-        return None
-
-    def set_tokens(self, tokens: Dict[str, OAuthToken]) -> None:
-        self._tokens = tokens
-
-    def set_token(self, token_id: str, token: OAuthToken) -> None:
-        if self._tokens is None:
-            self._tokens = {}
-        self._tokens[token_id] = token
-
-    def get_client_info(self) -> OAuthClientInformationFull | None:
-        return self._client_info
-
-    def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
-        self._client_info = client_info
+class AuthorizationCode(BaseModel):
+    code: str
+    scopes: list[str]
+    expires_at: float
+    client_id: str
+    code_verifier: str
+    code_challenge: str
+    redirect_uri: AnyHttpUrl
+    redirect_uri_provided_explicitly: bool

@@ -15,90 +15,70 @@
 # under the License.
 
 import click
+import logging
+import sys
+
 from fhirpy import AsyncFHIRClient
 from fhirpy.lib import AsyncFHIRResource
 from fhirpy.base.exceptions import OperationOutcome
 from fhirpy.base.searchset import Raw
 from mcp.server.fastmcp import FastMCP
 
-import logging
-
-from fhir_utils import (
+from utils import (
     create_async_fhir_client,
+    get_bundle_entries,
     get_operation_outcome_error,
     get_operation_outcome_exception,
     get_operation_outcome_required_error,
+    get_capability_statement,
+    trim_resource,
 )
+from typing import Dict, Any, Literal, Optional
+from pydantic import AnyHttpUrl
+
 from oauth.client_provider import FHIRClientProvider
 from oauth.common import handle_failed_authentication, handle_successful_authentication
 from oauth.server_provider import OAuthServerProvider
-from oauth.types import OAuthToken, ServerConfigs, TokenStorage
-from utils import get_capability_statement, trim_resource
-from typing import Dict, Any, Literal, Optional
+from oauth.types import OAuthToken, ServerConfigs
 
-from pydantic import AnyHttpUrl
 from starlette.requests import Request
 from starlette.responses import RedirectResponse, Response, HTMLResponse
 
 from mcp.server.auth.middleware.auth_context import get_access_token
-
+from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp.server import FastMCP
-from mcp.shared.auth import OAuthClientInformationFull
-import webbrowser
-import sys
-import asyncio
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 
-server_configs: ServerConfigs = ServerConfigs()
+configs: ServerConfigs = ServerConfigs()
 
-server_provider: OAuthServerProvider = OAuthServerProvider(configs=server_configs)
+server_provider: OAuthServerProvider = OAuthServerProvider(configs=configs)
 
 auth_settings: AuthSettings = AuthSettings(
-    issuer_url=AnyHttpUrl(server_configs.server_url),
+    issuer_url=AnyHttpUrl(configs.server_url),
     client_registration_options=ClientRegistrationOptions(
         enabled=True,
-        valid_scopes=server_configs.oauth.scopes_list,
-        default_scopes=server_configs.oauth.scopes_list,
+        valid_scopes=configs.oauth.scopes,
+        default_scopes=configs.oauth.scopes,
     ),
-    required_scopes=server_configs.oauth.scopes_list,
 )
 
 mcp: FastMCP = FastMCP(
     name="FHIR MCP Server",
-    instructions="FHIR MCP Server",
+    instructions="This server implements the HL7 FHIR MCP for secure, standards-based access to FHIR resources",
     auth_server_provider=server_provider,
-    host=server_configs.host,
-    port=server_configs.port,
-    debug=True,
+    host=configs.host,
+    port=configs.port,
     auth=auth_settings,
     json_response=True,
     stateless_http=True,
 )
 
-
-async def webbrowser_redirect_handler(authorization_url: str):
-    print(f"Opening user's browser with URL: {authorization_url}")
-    webbrowser.open_new_tab(authorization_url)
-
-
-client_info: OAuthClientInformationFull = OAuthClientInformationFull(
-    client_name="FHIR MCP Client",
-    redirect_uris=[server_configs.fhir.callback_url(server_configs.server_url)],
-    scope=server_configs.fhir.scopes,
-    client_id=server_configs.fhir.client_id,
-    client_secret=server_configs.fhir.client_secret,
-)
-
-token_storage: TokenStorage = TokenStorage(client_info=client_info)
-
 client_provider: FHIRClientProvider = FHIRClientProvider(
-    discovery_url=server_configs.fhir.discovery_url,
-    client_metadata=client_info,
-    storage=token_storage,
-    redirect_handler=webbrowser_redirect_handler,
+    callback_url=AnyHttpUrl(configs.fhir.callback_url(configs.server_url)),
+    configs=configs.fhir,
 )
 
 
@@ -141,63 +121,23 @@ async def handle_auth_server_callback(request: Request) -> Response:
         return handle_failed_authentication("Something went wrong.")
 
 
-async def get_client_access_token() -> str:
-    """Get the access token for the authenticated client."""
-    access_token = get_access_token()
-    if not access_token:
-        raise ValueError("Not authenticated")
-
-    # Get access token from mapping
-    access_token = server_provider.token_mapping.get(access_token.token)
-
-    if not access_token:
-        raise ValueError("No access token found for MCP client")
-
-    return access_token
-
-
 async def get_user_access_token() -> OAuthToken | None:
     """Get the access token for the authenticated user."""
-    client_access_token: str = await get_client_access_token()
-    user_access_token: OAuthToken | None = await client_provider.get_access_token(
-        client_access_token
-    )
+    client_access_token: AccessToken | None = get_access_token()
+    if not client_access_token:
+        raise ValueError("Failed to obtain client access token.")
 
-    if not user_access_token:
-        # Wait for user_access_token to become available, with a timeout
-        for _ in range(30):  # Try for up to 30 seconds
-            user_access_token: OAuthToken | None = client_provider.storage.get_token(
-                client_access_token
-            )
-            if user_access_token:
-                break
-            await asyncio.sleep(1)
-        if not user_access_token:
-            logger.error("Failed to obtain user access token.")
-    return user_access_token
-
-
-async def get_bundle_entries(bundle: Dict[str, Any]) -> Dict[str, Any]:
-    if "entry" in bundle and isinstance(bundle["entry"], list):
-        logger.debug(f"found {len(bundle['entry'])} entries for type '{type}'")
-        return {
-            "entry": [
-                entry.get("resource")
-                for entry in bundle["entry"]
-                if "resource" in entry
-            ]
-        }
-    return bundle
+    return await client_provider.get_access_token(client_access_token.token)
 
 
 async def get_async_fhir_client() -> AsyncFHIRClient:
-
+    """Get an async FHIR client with user access token."""
     user_token: OAuthToken | None = await get_user_access_token()
     if not user_token:
         raise ValueError("User is not authenticated")
 
     return await create_async_fhir_client(
-        config=server_configs.fhir, access_token=user_token.access_token
+        config=configs.fhir, access_token=user_token.access_token
     )
 
 
@@ -227,9 +167,7 @@ async def get_capabilities(type: str) -> Dict[str, Any]:
 
     logger.debug(f"Invoked with resource_type='{type}'")
     try:
-        data: Dict[str, Any] = await get_capability_statement(
-            server_configs.fhir.metadata_url
-        )
+        data: Dict[str, Any] = await get_capability_statement(configs.fhir.metadata_url)
         for resource in data["rest"][0]["resource"]:
             if resource.get("type") == type:
                 logger.info(f"Resource type '{type}' found in the CapabilityStatement.")

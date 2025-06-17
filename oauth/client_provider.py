@@ -14,33 +14,34 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from http.client import HTTPException
+import asyncio
 import anyio
 import httpx
 import logging
 import secrets
-import time
+import webbrowser
 
 from collections.abc import Awaitable, Callable
-from typing import Dict, Protocol
+from typing import Dict
 from urllib.parse import urlencode
-
-from mcp.shared.auth import (
-    OAuthClientInformationFull,
-    OAuthClientMetadata,
-)
-
-from oauth.types import OAuthMetadata, OAuthToken, TokenStorage
+from http.client import HTTPException
+from pydantic import AnyHttpUrl
+from oauth.types import FHIROAuthConfigs, OAuthMetadata, OAuthToken
 from oauth.common import (
     discover_oauth_metadata,
     is_token_expired,
     get_endpoint,
     generate_code_verifier,
     generate_code_challenge,
+    perform_token_flow,
 )
-from mcp.shared._httpx_utils import create_mcp_http_client
 
 logger = logging.getLogger(__name__)
+
+
+async def webbrowser_redirect_handler(authorization_url: str):
+    print(f"Opening user's browser with URL: {authorization_url}")
+    webbrowser.open_new_tab(authorization_url)
 
 
 class FHIRClientProvider(httpx.Auth):
@@ -51,35 +52,29 @@ class FHIRClientProvider(httpx.Auth):
 
     def __init__(
         self,
-        discovery_url: str,
-        client_metadata: OAuthClientMetadata,
-        storage: TokenStorage,
-        redirect_handler: Callable[[str], Awaitable[None]],
-        timeout: float = 300.0,
+        callback_url: AnyHttpUrl,
+        configs: FHIROAuthConfigs,
+        redirect_handler: Callable[
+            [str], Awaitable[None]
+        ] = webbrowser_redirect_handler,
     ):
         """
         Initialize OAuth2 authentication.
 
         Args:
-            discovery_url: Discovery URL of the server capabilities
-            client_metadata: OAuth client metadata
-            storage: Token storage implementation (defaults to in-memory)
+            callback_url: Callback URL of the FHIR client
+            configs: FHIR server configurations
             redirect_handler: Function to handle authorization URL like opening browser
-            callback_handler: Function to wait for callback and return (auth_code, state)
-            timeout: Timeout for OAuth flow in seconds
         """
-        self.discovery_url = discovery_url
-        self.client_metadata = client_metadata
-        self.storage = storage
+        self.callback_url = callback_url
         self.redirect_handler = redirect_handler
-        self.timeout = timeout
+        self.configs = configs
 
-        # Cached authentication state
-        self._metadata: OAuthMetadata | None = None
-
+        self.state_mapping: dict[str, dict[str, str]] = {}
+        self.token_mapping: Dict[str, OAuthToken | None] = {}
         # Thread safety lock
         self._token_lock = anyio.Lock()
-        self._state_mapping: dict[str, dict[str, str]] = {}
+        self._metadata: OAuthMetadata | None = None
 
     def _generate_code_verifier(self) -> str:
         """Generate a cryptographically random code verifier for PKCE."""
@@ -96,13 +91,11 @@ class FHIRClientProvider(httpx.Auth):
         Discover OAuth metadata from server's well-known endpoint.
         """
 
-        return await discover_oauth_metadata(
-            metadata_url=discovery_url, headers={"Accept": "application/fhir+json"}
-        )
+        return await discover_oauth_metadata(metadata_url=discovery_url)
 
     def _is_valid_token(self, token_id: str) -> bool:
         """Check if current token is valid."""
-        current_token: OAuthToken | None = self.storage.get_token(token_id)
+        current_token: OAuthToken | None = self.token_mapping.get(token_id)
         return not is_token_expired(current_token)
 
     async def _validate_token_scopes(self, token_response: OAuthToken) -> None:
@@ -118,34 +111,26 @@ class FHIRClientProvider(httpx.Auth):
         # Check explicitly requested scopes only
         requested_scopes: set[str] = set()
 
-        if self.client_metadata.scope:
+        if self.configs.scope:
             # Validate against explicit scope request
-            requested_scopes = set(self.client_metadata.scope.split())
+            requested_scopes = set(self.configs.scopes)
 
             # Check for unauthorized scopes
-            returned_scopes = set(token_response.scope.split())
+            returned_scopes = set(token_response.scope.split(" "))
             unauthorized_scopes = returned_scopes - requested_scopes
 
             if unauthorized_scopes:
-                raise Exception(
+                logger.debug(
                     f"Server granted unauthorized scopes: {unauthorized_scopes}. "
                     f"Requested: {requested_scopes}, Returned: {returned_scopes}"
                 )
+                raise ValueError("scope validation failed!")
         else:
             # No explicit scopes requested - accept server defaults
             logger.debug(
                 f"No explicit scopes requested, accepting server-granted "
-                f"scopes: {set(token_response.scope.split())}"
+                f"scopes: {token_response.scope}"
             )
-
-    async def _get_client_info(self) -> OAuthClientInformationFull:
-        """Get the client info."""
-
-        client_info: OAuthClientInformationFull | None = self.storage.get_client_info()
-
-        if not client_info:
-            raise Exception("No client information available")
-        return client_info
 
     async def ensure_token(self, token_id: str) -> None:
         """Ensure valid access token, refreshing or re-authenticating as needed."""
@@ -167,10 +152,9 @@ class FHIRClientProvider(httpx.Auth):
 
         # Discover OAuth metadata
         if not self._metadata:
-            self._metadata = await self._discover_oauth_metadata(self.discovery_url)
-
-        # Ensure client registration
-        client_info: OAuthClientInformationFull = await self._get_client_info()
+            self._metadata = await self._discover_oauth_metadata(
+                self.configs.discovery_url
+            )
 
         # Generate PKCE challenge
         code_verifier: str = self._generate_code_verifier()
@@ -182,20 +166,20 @@ class FHIRClientProvider(httpx.Auth):
         state: str = secrets.token_urlsafe(32)
         auth_params: Dict[str, str] = {
             "response_type": "code",
-            "client_id": client_info.client_id,
-            "redirect_uri": str(self.client_metadata.redirect_uris[0]),
+            "client_id": self.configs.client_id,
+            "redirect_uri": str(self.callback_url),
             "state": state,
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
         }
 
         # Include explicit scopes only
-        if self.client_metadata.scope:
-            auth_params["scope"] = self.client_metadata.scope
+        if self.configs.scope:
+            auth_params["scope"] = self.configs.scope
 
         auth_url: str = f"{authorization_endpoint}?{urlencode(auth_params)}"
 
-        self._state_mapping[state] = {
+        self.state_mapping[state] = {
             **auth_params,
             "token_id": token_id,
             "code_verifier": code_verifier,
@@ -206,7 +190,7 @@ class FHIRClientProvider(httpx.Auth):
 
     async def handle_fhir_oauth_callback(self, code: str, state: str) -> None:
 
-        state_mapping: Dict[str, str] | None = self._state_mapping.get(state)
+        state_mapping: Dict[str, str] | None = self.state_mapping.get(state)
         if not state_mapping:
             raise HTTPException(400, "Invalid state parameter")
 
@@ -223,61 +207,28 @@ class FHIRClientProvider(httpx.Auth):
         code_verifier: str,
     ) -> None:
         """Exchange authorization code for access token."""
-        token_endpoint: str = self._get_token_endpoint()
 
-        client_info: OAuthClientInformationFull = await self._get_client_info()
-
-        token_payload: dict = {
+        access_token_payload: dict = {
             "grant_type": "authorization_code",
             "code": auth_code,
-            "redirect_uri": str(self.client_metadata.redirect_uris[0]),
-            "client_id": client_info.client_id,
+            "redirect_uri": str(self.callback_url),
+            "client_id": self.configs.client_id,
+            "client_secret": self.configs.client_secret,
             "code_verifier": code_verifier,
         }
 
-        if client_info.client_secret:
-            token_payload["client_secret"] = client_info.client_secret
-
-        async with create_mcp_http_client() as client:
-            response = await client.post(
-                url=token_endpoint,
-                data=token_payload,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=30.0,
+        try:
+            token: OAuthToken = await perform_token_flow(
+                url=self._get_token_endpoint(),
+                data=access_token_payload,
+                timeout=self.configs.timeout,
             )
 
-            if response.status_code != 200:
-                # Parse OAuth error response
-                try:
-                    error_data = response.json()
-                    error_msg = error_data.get(
-                        "error_description",
-                        error_data.get("error", "Token generation failed"),
-                    )
-                    raise Exception(
-                        f"Token exchange failed: {error_msg} "
-                        f"(HTTP {response.status_code})"
-                    )
-                except Exception:
-                    raise Exception(
-                        f"Token exchange failed: {response.status_code} {response.text}"
-                    )
-
-            # Parse token response
-            token_response: OAuthToken = OAuthToken.model_validate(response.json())
-
-            # Validate token scopes
-            await self._validate_token_scopes(token_response)
-
-            # Calculate token expiry
-            if not token_response.expires_at:
-                if token_response.expires_in:
-                    token_response.expires_at = time.time() + token_response.expires_in
-                else:
-                    token_response.expires_at = time.time() + 3600
-
-            # Store tokens
-            self.storage.set_token(token_id, token_response)
+            await self._validate_token_scopes(token)
+            self.token_mapping[token_id] = token
+        except Exception as ex:
+            logger.exception("Access token request failed. Caused by, ", exc_info=ex)
+            raise ValueError("Access token request failed")
 
     def _get_authorization_endpoint(self) -> str:
         """Get authorization endpoint."""
@@ -287,64 +238,48 @@ class FHIRClientProvider(httpx.Auth):
         """Get token endpoint."""
         return get_endpoint(self._metadata, "token_endpoint")
 
-    async def _refresh_access_token(self, token_id: str) -> bool:
+    async def _refresh_access_token(self, token_id: str) -> None:
         """Refresh access token using refresh token."""
 
-        current_token: OAuthToken | None = self.storage.get_token(token_id)
+        current_token: OAuthToken | None = self.token_mapping.get(token_id)
 
         if not current_token:
-            return False
+            logger.debug("Unable to perform token refresh. No access token found!")
+            return None
 
-        token_endpoint: str = self._get_token_endpoint()
-
-        # Get client credentials
-        client_info: OAuthClientInformationFull = await self._get_client_info()
-
-        refresh_token_payload = {
+        refresh_token_payload: dict = {
             "grant_type": "refresh_token",
             "refresh_token": current_token.refresh_token,
-            "client_id": client_info.client_id,
-            "client_secret": client_info.client_secret,
+            "client_id": self.configs.client_id,
+            "client_secret": self.configs.client_secret,
         }
 
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    url=token_endpoint,
-                    data=refresh_token_payload,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    timeout=30.0,
-                )
+            new_token: OAuthToken = await perform_token_flow(
+                url=self._get_token_endpoint(),
+                data=refresh_token_payload,
+                timeout=self.configs.timeout,
+            )
 
-                if response.status_code != 200:
-                    logger.error(f"Token refresh failed: {response.status_code}")
-                    return False
-
-                # Parse refreshed tokens
-                token_response: OAuthToken = OAuthToken.model_validate(response.json())
-
-                # Validate token scopes
-                await self._validate_token_scopes(token_response)
-
-                # Calculate token expiry
-                if not token_response.expires_at:
-                    if token_response.expires_in:
-                        token_response.expires_at = (
-                            time.time() + token_response.expires_in
-                        )
-                    else:
-                        token_response.expires_at = time.time() + 3600
-
-                # Store refreshed tokens
-                self.storage.set_token(token_id, token_response)
-
-                return True
-
+            await self._validate_token_scopes(new_token)
+            self.token_mapping[token_id] = new_token
         except Exception as ex:
-            logger.exception("Token refresh failed. Caused by, ", ex)
-            return False
+            logger.exception("Token refresh failed. Caused by, ", exc_info=ex)
+            raise ValueError("Token refresh failed")
 
     async def get_access_token(self, token_id: str) -> OAuthToken | None:
         """Get access token for the given token ID."""
         await self.ensure_token(token_id)
-        return self.storage.get_token(token_id)
+        access_token: OAuthToken | None = self.token_mapping.get(token_id)
+
+        if not access_token:
+            # Wait for user_access_token to become available, with a timeout
+            for _ in range(self.configs.timeout):
+                access_token: OAuthToken | None = self.token_mapping.get(token_id)
+                if access_token:
+                    break
+                await asyncio.sleep(1)
+            if not access_token:
+                logger.error("Failed to obtain user access token.")
+                raise ValueError("Failed to obtain user access token.")
+        return access_token

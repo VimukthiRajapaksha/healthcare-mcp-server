@@ -18,27 +18,27 @@ import logging
 import secrets
 import time
 
+from typing import Dict
 from pydantic import AnyHttpUrl
 from starlette.exceptions import HTTPException
-
+from urllib.parse import urlencode
 from mcp.server.auth.provider import (
     AccessToken,
-    AuthorizationCode,
     OAuthAuthorizationServerProvider,
     RefreshToken,
     AuthorizationParams,
     construct_redirect_uri,
 )
-from mcp.shared._httpx_utils import create_mcp_http_client
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
-
+from oauth.types import AuthorizationCode, OAuthMetadata, OAuthToken as OAuth2Token
+from oauth.types import OAuthMetadata, ServerConfigs
 from oauth.common import (
     discover_oauth_metadata,
     get_endpoint,
     generate_code_challenge,
     generate_code_verifier,
+    perform_token_flow,
 )
-from oauth.types import OAuthMetadata, ServerConfigs
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +48,10 @@ class OAuthServerProvider(OAuthAuthorizationServerProvider):
     def __init__(self, configs: ServerConfigs):
         self.configs = configs
 
-        self.clients: dict[str, OAuthClientInformationFull] = {}
-        self.auth_codes: dict[str, AuthorizationCode] = {}
-        self.tokens: dict[str, AccessToken] = {}
-        self.state_mapping: dict[str, dict[str, str]] = {}
-        self.token_mapping: dict[str, str] = {}
+        self.clients: Dict[str, OAuthClientInformationFull] = {}
+        self.auth_code_mapping: Dict[str, AuthorizationCode] = {}
+        self.token_mapping: Dict[str, AccessToken | RefreshToken] = {}
+        self.state_mapping: Dict[str, Dict[str, str]] = {}
 
         self._metadata: OAuthMetadata | None = None
 
@@ -60,32 +59,28 @@ class OAuthServerProvider(OAuthAuthorizationServerProvider):
         """Initialize the OAuth server."""
         self._metadata = await self._discover_oauth_metadata()
 
-    #
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         """Get OAuth client information."""
         return self.clients.get(client_id)
 
-    #
     async def register_client(self, client_info: OAuthClientInformationFull):
         """Register a new OAuth client."""
         self.clients[client_info.client_id] = client_info
 
-    #
     async def authorize(
         self, client: OAuthClientInformationFull, params: AuthorizationParams
     ) -> str:
         """Generate an authorization URL for OAuth flow."""
-
-        # Discover OAuth metadata
         if not self._metadata:
             self._metadata = await self._discover_oauth_metadata()
 
         authorization_endpoint: str = await self._get_authorization_endpoint()
 
-        state: str = params.state or secrets.token_hex(16)
         # Generate PKCE challenge
         code_verifier: str = self._generate_code_verifier()
         code_challenge: str = self._generate_code_challenge(code_verifier)
+
+        state: str = params.state or secrets.token_hex(16)
 
         # Store the state mapping
         self.state_mapping[state] = {
@@ -96,25 +91,28 @@ class OAuthServerProvider(OAuthAuthorizationServerProvider):
                 params.redirect_uri_provided_explicitly
             ),
             "client_id": client.client_id,
+            **({"scope": " ".join(params.scopes)} if params.scopes else {}),
         }
 
-        auth_url: str = (
-            f"{authorization_endpoint}"
-            f"?client_id={self.configs.oauth.client_id}"
-            f"&redirect_uri={self.configs.oauth.callback_url(self.configs.server_url)}"
-            f"&scope={self.configs.oauth.scopes}"
-            f"&state={state}"
-            f"&code_challenge={code_challenge}"
-            "&code_challenge_method=S256"
-            "&response_type=code"
-        )
+        auth_params: Dict[str, str] = {
+            "response_type": "code",
+            "scope": self.configs.oauth.scope,
+            "client_id": self.configs.oauth.client_id,
+            "redirect_uri": str(
+                self.configs.oauth.callback_url(self.configs.server_url)
+            ),
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
 
+        auth_url: str = f"{authorization_endpoint}?{urlencode(auth_params)}"
         logger.debug(f"Redirecting the request to authorization URL: {auth_url}")
         return auth_url
 
     async def handle_mcp_oauth_callback(self, code: str, state: str) -> str:
         """Handle OAuth redirect."""
-        state_data: dict[str, str] | None = self.state_mapping.get(state)
+        state_data: Dict[str, str] | None = self.state_mapping.get(state)
         if not state_data:
             raise HTTPException(400, "Invalid state parameter")
 
@@ -125,134 +123,117 @@ class OAuthServerProvider(OAuthAuthorizationServerProvider):
         )
         client_id: str = state_data["client_id"]
         code_verifier: str = state_data["code_verifier"]
+        scope: str | None = state_data.get("scope")
 
-        token_endpoint: str = await self._get_token_endpoint()
-
-        # Exchange code for token
-        async with create_mcp_http_client() as client:
-            response = await client.post(
-                token_endpoint,
-                data={
-                    "grant_type": "authorization_code",
-                    "client_id": self.configs.oauth.client_id,
-                    "client_secret": self.configs.oauth.client_secret,
-                    "code": code,
-                    "redirect_uri": self.configs.oauth.callback_url(
-                        self.configs.server_url
-                    ),
-                    "code_verifier": code_verifier,
-                },
-                headers={"Accept": "application/json"},
-            )
-
-            if response.status_code != 200:
-                logger.debug(f"Failed to exchange code for token: {response}")
-                raise HTTPException(400, "Failed to exchange code for token")
-            
-            data: dict = response.json()
-
-            logger.debug(f"Received token response: {data}")
-
-            if "error" in data:
-                logger.debug(f"Unable to generate access token: {data}")
-                raise HTTPException(400, data.get("error_description", data["error"]))
-
-            access_token: str = data["access_token"]
-            expires_in: int = data.get("expires_in", 3600)
-
-            # Create MCP authorization code
-            mcp_auth_code: str = f"fhir_mcp_{secrets.token_hex(16)}"
-            self.auth_codes[mcp_auth_code] = AuthorizationCode(
-                code=mcp_auth_code,
-                client_id=client_id,
-                redirect_uri=AnyHttpUrl(redirect_uri),
-                redirect_uri_provided_explicitly=redirect_uri_provided_explicitly,
-                expires_at=int(time.time()) + expires_in,
-                scopes=self.configs.oauth.scopes_list,
-                code_challenge=code_challenge,
-            )
-
-            self.tokens[access_token] = AccessToken(
-                token=access_token,
-                client_id=client_id,
-                scopes=self.configs.oauth.scopes_list,
-                expires_at=int(time.time()) + expires_in,
-            )
+        # Create MCP authorization code
+        mcp_auth_code: str = f"fhir_mcp_{secrets.token_hex(16)}"
+        self.auth_code_mapping[mcp_auth_code] = AuthorizationCode(
+            code=code,
+            client_id=client_id,
+            redirect_uri=AnyHttpUrl(redirect_uri),
+            redirect_uri_provided_explicitly=redirect_uri_provided_explicitly,
+            expires_at=int(time.time() + 600),  # 10 min
+            scopes=scope.strip().split(" ") if scope else [],
+            code_verifier=code_verifier,
+            code_challenge=code_challenge,
+        )
 
         del self.state_mapping[state]
         return construct_redirect_uri(redirect_uri, code=mcp_auth_code, state=state)
 
-    #
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str
     ) -> AuthorizationCode | None:
-        """Load an authorization code."""
-        return self.auth_codes.get(authorization_code)
+        """Load an validate authorization code."""
+        auth_code: AuthorizationCode | None = self.auth_code_mapping.get(
+            authorization_code
+        )
+        if not auth_code:
+            return None
+        if auth_code.client_id != client.client_id:
+            return None
+        if auth_code.expires_at < time.time():
+            return None
 
-    #
+        del self.auth_code_mapping[authorization_code]
+        return auth_code
+
     async def exchange_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
         """Exchange authorization code for tokens."""
-        if authorization_code.code not in self.auth_codes:
-            raise ValueError("Invalid authorization code")
+        if client.client_id != authorization_code.client_id:
+            raise ValueError("Client authentication failed")
 
-        # Generate MCP access token
-        mcp_token: str = f"fhir_mcp_{secrets.token_hex(32)}"
+        access_token_payload: Dict = {
+            "grant_type": "authorization_code",
+            "code": authorization_code.code,
+            "code_verifier": authorization_code.code_verifier,
+            "client_id": self.configs.oauth.client_id,
+            "client_secret": self.configs.oauth.client_secret,
+            "redirect_uri": self.configs.oauth.callback_url(self.configs.server_url),
+        }
 
-        # Store MCP token
-        self.tokens[mcp_token] = AccessToken(
-            token=mcp_token,
-            client_id=client.client_id,
-            scopes=authorization_code.scopes,
-            expires_at=int(authorization_code.expires_at),
+        token: OAuth2Token = await perform_token_flow(
+            url=await self._get_token_endpoint(),
+            data=access_token_payload,
+            headers={"Accept": "application/json"},
         )
 
-        # Find access token for this client
-        access_token: str | None = next(
-            (
-                token
-                for token, data in self.tokens.items()
-                if data.client_id == client.client_id
-            ),
-            None,
+        # Generate MCP tokens
+        mcp_access_token: str = f"fhir_mcp_{secrets.token_hex(32)}"
+        mcp_refresh_token: str = f"fhir_mcp_{secrets.token_hex(32)}"
+
+        self.token_mapping[mcp_access_token] = AccessToken(
+            token=token.access_token,
+            client_id=self.configs.oauth.client_id,
+            scopes=token.scopes,
+            expires_at=int(token.expires_at or 3600),
         )
 
-        # Store mapping between MCP access token and third-party access token
-        if access_token:
-            self.token_mapping[mcp_token] = access_token
-
-        del self.auth_codes[authorization_code.code]
+        if token.refresh_token:
+            self.token_mapping[mcp_refresh_token] = RefreshToken(
+                token=token.refresh_token,
+                client_id=self.configs.oauth.client_id,
+                scopes=token.scopes,
+                expires_at=int(token.expires_at or 3600),
+            )
 
         return OAuthToken(
-            access_token=mcp_token,
+            access_token=mcp_access_token,
+            refresh_token=mcp_refresh_token,
             token_type="bearer",
-            expires_in=int(authorization_code.expires_at),
+            expires_in=token.expires_in,
             scope=" ".join(authorization_code.scopes),
         )
 
-    #
     async def load_access_token(self, token: str) -> AccessToken | None:
         """Load and validate an access token."""
-        access_token = self.tokens.get(token)
+        access_token: AccessToken | RefreshToken | None = self.token_mapping.get(token)
         if not access_token:
             return None
-
-        # Check if expired
         if access_token.expires_at and access_token.expires_at < time.time():
-            del self.tokens[token]
             return None
+        if isinstance(access_token, AccessToken):
+            return access_token
+        return None
 
-        return access_token
-
-    #
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
-        """Load a refresh token - not supported."""
+        """Load and validate refresh token."""
+        token = self.token_mapping.get(refresh_token)
+
+        if not token:
+            return None
+        if token.client_id != client.client_id:
+            return None
+        if token.expires_at and token.expires_at < time.time():
+            return None
+        if isinstance(token, RefreshToken):
+            return token
         return None
 
-    #
     async def exchange_refresh_token(
         self,
         client: OAuthClientInformationFull,
@@ -260,15 +241,55 @@ class OAuthServerProvider(OAuthAuthorizationServerProvider):
         scopes: list[str],
     ) -> OAuthToken:
         """Exchange refresh token"""
-        raise NotImplementedError("Not supported")
+        if refresh_token.client_id != client.client_id:
+            raise ValueError("Client authentication failed")
 
-    #
+        refresh_token_payload: Dict = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": self.configs.oauth.client_id,
+            "client_secret": self.configs.oauth.client_secret,
+            "scopes": " ".join(scopes),
+        }
+        new_token: OAuth2Token = await perform_token_flow(
+            url=await self._get_token_endpoint(),
+            data=refresh_token_payload,
+            headers={"Accept": "application/json"},
+        )
+
+        # Generate new MCP tokens
+        mcp_access_token: str = f"fhir_mcp_{secrets.token_hex(32)}"
+        mcp_refresh_token: str = f"fhir_mcp_{secrets.token_hex(32)}"
+
+        self.token_mapping[mcp_access_token] = AccessToken(
+            token=new_token.access_token,
+            scopes=new_token.scopes,
+            expires_at=int(new_token.expires_at or 3600),
+            client_id=client.client_id,
+        )
+
+        if new_token.refresh_token:
+            self.token_mapping[mcp_refresh_token] = RefreshToken(
+                token=new_token.refresh_token,
+                scopes=new_token.scopes,
+                expires_at=int(new_token.expires_at or 3600),
+                client_id=client.client_id,
+            )
+
+        return OAuthToken(
+            access_token=mcp_access_token,
+            refresh_token=mcp_refresh_token,
+            token_type="bearer",
+            expires_in=int(new_token.expires_in or 3600),
+            scope=new_token.scope,
+        )
+
     async def revoke_token(
         self, token: str, token_type_hint: str | None = None
     ) -> None:
         """Revoke a token."""
-        if token in self.tokens:
-            del self.tokens[token]
+        if token in self.token_mapping:
+            del self.token_mapping[token]
 
     async def _discover_oauth_metadata(self) -> OAuthMetadata | None:
 
@@ -277,7 +298,6 @@ class OAuthServerProvider(OAuthAuthorizationServerProvider):
             headers={"Accept": "application/json"},
         )
 
-    # Replace endpoint extraction methods
     async def _get_authorization_endpoint(self) -> str:
         return get_endpoint(self._metadata, "authorization_endpoint")
 
