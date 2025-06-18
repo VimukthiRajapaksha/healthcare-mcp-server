@@ -27,6 +27,7 @@ from mcp.server.fastmcp import FastMCP
 from utils import (
     create_async_fhir_client,
     get_bundle_entries,
+    get_default_headers,
     get_operation_outcome_error,
     get_operation_outcome_exception,
     get_operation_outcome_required_error,
@@ -137,7 +138,9 @@ async def get_async_fhir_client() -> AsyncFHIRClient:
         raise ValueError("User is not authenticated")
 
     return await create_async_fhir_client(
-        config=configs.fhir, access_token=user_token.access_token
+        config=configs.fhir,
+        access_token=user_token.access_token,
+        extra_headers=get_default_headers(),
     )
 
 

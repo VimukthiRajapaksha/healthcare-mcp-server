@@ -41,36 +41,62 @@ Run the server:
 uv run server.py
 ```
 
-Run the server in the MCP Inspector mode:
-```bash
-mcp dev server.py
-```
-
 ## VS Code Integration
 Add the following JSON block to your User Settings (JSON) file in VS Code. You can do this by pressing Ctrl + Shift + P and typing Preferences: Open User Settings (JSON).
 
 ```json
 "mcp": {
     "servers": {
-        "healthcare": {
-            "command": "uv",
+        "fhir": {
+            "command": "npx",
             "args": [
-                "run",
-                "--with",
-                "mcp[cli]",
-                "--with",
-                "requests",
-                "mcp",
-                "run",
-                "ABSOLUTE PATH TO YOUR SERVER.PY FILE"
-            ],
-            "env": {
-                "FHIR_BASE_URL": "https://hapi.fhir.org/baseR4"
-            }
+                "-y",
+                "mcp-remote",
+                "http://localhost:8000/mcp"
+            ]
         }
     }
 }
 ```
+
+## Claude Desktop Integration
+Add the following JSON block to your Claude Desktop settings to connect to your local MCP server. 
+ - Launch the Claude Desktop app, click on the Claude menu in the top bar, and select "Settings…".
+ - In the Settings pane, click “Developer” in the left sidebar. Then click "Edit Config". This will open your configuration file in your file system. If it doesn’t exist yet, Claude will create one automatically at:
+    - macOS: ~/Library/Application Support/Claude/claude_desktop_config.json
+    - Windows: %APPDATA%\Claude\claude_desktop_config.json
+ - Open the claude_desktop_config.json file in any text editor. Replace its contents with the following JSON block to register the MCP server:
+
+```json
+{
+    "mcpServers": {
+        "fhir": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "mcp-remote",
+                "http://localhost:8000/mcp"
+            ]
+        }
+    }
+}
+```
+
+
+## MCP Inspector Integration
+Follow these steps to get the MCP Inspector up and running:
+
+- Open a terminal and run the following command:
+    
+    `npx -y @modelcontextprotocol/inspector`
+    
+- In the MCP Inspector interface:
+    - Transport Type: Select Streamable HTTP
+    - URL: Enter http://localhost:8000/mcp
+
+Make sure your MCP server is already running and listening on the above endpoint.
+
+Once connected, MCP Inspector will allow you to visualize tool invocations, inspect request/response payloads, and debug your tool implementations easily.
 
 ## Example Prompts
 - Get allergy history for patient 53373

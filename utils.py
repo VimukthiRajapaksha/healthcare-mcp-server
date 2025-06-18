@@ -99,9 +99,7 @@ async def get_capability_statement(metadata_url: str) -> Dict[str, Any]:
     """
     try:
         async with create_mcp_http_client() as client:
-            response = await client.get(
-                url=metadata_url, headers={"Accept": "application/fhir+json"}
-            )
+            response = await client.get(url=metadata_url, headers=get_default_headers())
             response.raise_for_status()
             metadata_json = response.json()
             logger.debug(f"OAuth metadata discovered: {metadata_json}")
@@ -111,3 +109,7 @@ async def get_capability_statement(metadata_url: str) -> Dict[str, Any]:
             "Unable to invoke the FHIR metadata endpoint. Caused by, ", exc_info=ex
         )
         raise ValueError("Unable to fetch FHIR metadata")
+
+
+def get_default_headers() -> Dict[str, str]:
+    return {"Accept": "application/fhir+json"}
