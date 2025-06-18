@@ -34,7 +34,7 @@ from utils import (
     get_capability_statement,
     trim_resource,
 )
-from typing import Dict, Any, Literal, Optional
+from typing import Dict, Any, Optional
 from pydantic import AnyHttpUrl
 
 from oauth.client_provider import FHIRClientProvider
@@ -461,21 +461,31 @@ async def delete(
 
 @click.command()
 @click.option(
-    "--transport", default="streamable-http", help="Transport protocol to use"
+    "--transport",
+    type=click.Choice(["stdio", "sse", "streamable-http"]),
+    default="streamable-http",
+    show_default=True,
+    help="Transport protocol to use",
 )
-@click.option("--log-level", default="INFO", help="Log level to use")
-def main(
-    transport: Literal["stdio", "sse", "streamable-http"],
-    log_level: Literal["DEBUG", "INFO", "ERROR"],
-) -> int:
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARN", "ERROR"], case_sensitive=False),
+    default="INFO",
+    show_default=True,
+    help="Log level to use",
+)
+def main(transport, log_level) -> None:
+    """Start the FHIR MCP server."""
+    logger.setLevel(log_level.upper())
     try:
-        logger.setLevel(log_level.upper())
         logger.info(f"Starting FHIR MCP server with {transport} transport")
         mcp.run(transport=transport)
-    except ValueError as e:
-        logger.error(f"Unable to run the FHIR MCP server. Caused by, ", exc_info=e)
-        return 1
-    return 0
+    except Exception as ex:
+        logger.error(
+            f"Unable to run the FHIR MCP server. Caused by, %s", ex, exc_info=True
+        )
+        sys.exit(1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
@@ -483,4 +493,4 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="[%(asctime)s] %(levelname)s {%(name)s.%(funcName)s:%(lineno)d} - %(message)s",
     )
-    sys.exit(main())
+    main()
