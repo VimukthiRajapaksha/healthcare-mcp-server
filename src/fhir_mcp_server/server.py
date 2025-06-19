@@ -18,13 +18,7 @@ import click
 import logging
 import sys
 
-from fhirpy import AsyncFHIRClient
-from fhirpy.lib import AsyncFHIRResource
-from fhirpy.base.exceptions import OperationOutcome
-from fhirpy.base.searchset import Raw
-from mcp.server.fastmcp import FastMCP
-
-from utils import (
+from fhir_mcp_server.utils import (
     create_async_fhir_client,
     get_bundle_entries,
     get_default_headers,
@@ -34,17 +28,22 @@ from utils import (
     get_capability_statement,
     trim_resource,
 )
+from fhir_mcp_server.oauth import (
+    handle_failed_authentication,
+    handle_successful_authentication,
+    OAuthServerProvider,
+    FHIRClientProvider,
+    OAuthToken,
+    ServerConfigs,
+)
+from fhirpy import AsyncFHIRClient
+from fhirpy.lib import AsyncFHIRResource
+from fhirpy.base.exceptions import OperationOutcome
+from fhirpy.base.searchset import Raw
 from typing import Dict, Any, Optional
 from pydantic import AnyHttpUrl
-
-from oauth.client_provider import FHIRClientProvider
-from oauth.common import handle_failed_authentication, handle_successful_authentication
-from oauth.server_provider import OAuthServerProvider
-from oauth.types import OAuthToken, ServerConfigs
-
 from starlette.requests import Request
 from starlette.responses import RedirectResponse, Response, HTMLResponse
-
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
@@ -58,7 +57,7 @@ configs: ServerConfigs = ServerConfigs()
 server_provider: OAuthServerProvider = OAuthServerProvider(configs=configs)
 
 auth_settings: AuthSettings = AuthSettings(
-    issuer_url=AnyHttpUrl(configs.server_url),
+    issuer_url=AnyHttpUrl(configs.effective_server_url),
     client_registration_options=ClientRegistrationOptions(
         enabled=True,
         valid_scopes=configs.oauth.scopes,
@@ -78,7 +77,7 @@ mcp: FastMCP = FastMCP(
 )
 
 client_provider: FHIRClientProvider = FHIRClientProvider(
-    callback_url=AnyHttpUrl(configs.fhir.callback_url(configs.server_url)),
+    callback_url=AnyHttpUrl(configs.fhir.callback_url(configs.effective_server_url)),
     configs=configs.fhir,
 )
 
@@ -124,6 +123,10 @@ async def handle_auth_server_callback(request: Request) -> Response:
 
 async def get_user_access_token() -> OAuthToken | None:
     """Get the access token for the authenticated user."""
+    if configs.fhir.access_token:
+        logger.debug("Using configured FHIR access token for user.")
+        return OAuthToken(access_token=configs.fhir.access_token, token_type="Bearer")
+
     client_access_token: AccessToken | None = get_access_token()
     if not client_access_token:
         raise ValueError("Failed to obtain client access token.")
@@ -137,6 +140,9 @@ async def get_async_fhir_client() -> AsyncFHIRClient:
     if not user_token:
         raise ValueError("User is not authenticated")
 
+    logger.debug(
+        f"Creating async FHIR client with access token: {user_token.access_token}"
+    )
     return await create_async_fhir_client(
         config=configs.fhir,
         access_token=user_token.access_token,
@@ -168,8 +174,8 @@ async def get_capabilities(type: str) -> Dict[str, Any]:
                     Each key is the operation name (e.g., "$validate"), and each value explains the operation's purpose.
     """
 
-    logger.debug(f"Invoked with resource_type='{type}'")
     try:
+        logger.debug(f"Invoked with resource_type='{type}'")
         data: Dict[str, Any] = await get_capability_statement(configs.fhir.metadata_url)
         for resource in data["rest"][0]["resource"]:
             if resource.get("type") == type:
@@ -213,18 +219,34 @@ async def search(
         Dict[str, Any]: A dictionary containing the full FHIR resource instance matching the search criteria.
     """
 
-    logger.debug(f"Invoked with type='{type}' and searchParam={searchParam}")
-
     try:
+        logger.debug(f"Invoked with type='{type}' and searchParam={searchParam}")
         if not type:
-            logger.error("Unable to perform search: 'type' is a mandatory field.")
+            logger.error(
+                "Unable to perform search operation: 'type' is a mandatory field."
+            )
             return await get_operation_outcome_required_error("type")
 
         client: AsyncFHIRClient = await get_async_fhir_client()
         return await client.resources(type).search(Raw(**searchParam)).fetch()
+    except ValueError as ex:
+        logger.exception(
+            f"User does not have permission to perform FHIR '{type}' resource search operation. Caused by, ",
+            exc_info=ex,
+        )
+        return await get_operation_outcome_error(
+            code="forbidden",
+            diagnostics=f"The user does not have the rights to perform search operation.",
+        )
+    except OperationOutcome as ex:
+        logger.exception(
+            f"FHIR server returned an OperationOutcome error while searching the resource: '{type}', Caused by,",
+            exc_info=ex,
+        )
+        return ex.resource["issue"] or await get_operation_outcome_exception()
     except Exception as ex:
         logger.exception(
-            f"Error while executing the FHIR search interaction for resource_type '{type}'. Caused by, ",
+            f"An unexpected error occurred during the FHIR search operation for resource: '{type}'. Caused by, ",
             exc_info=ex,
         )
     return await get_operation_outcome_exception()
@@ -258,13 +280,14 @@ async def read(
         Dict[str, Any]: A dictionary containing the single FHIR resource instance of the requested type and id.
     """
 
-    logger.debug(
-        f"Invoked with type='{type}', id={id}, searchParam={searchParam}, and operation={operation}"
-    )
-
     try:
+        logger.debug(
+            f"Invoked with type='{type}', id={id}, searchParam={searchParam}, and operation={operation}"
+        )
         if not type:
-            logger.error("Unable to perform read: 'type' is a mandatory field.")
+            logger.error(
+                "Unable to perform read operation: 'type' is a mandatory field."
+            )
             return await get_operation_outcome_required_error("type")
 
         client: AsyncFHIRClient = await get_async_fhir_client()
@@ -273,9 +296,24 @@ async def read(
         )
 
         return await get_bundle_entries(bundle=bundle)
+    except ValueError as ex:
+        logger.exception(
+            f"User does not have permission to perform FHIR '{type}' resource read operation. Caused by, ",
+            exc_info=ex,
+        )
+        return await get_operation_outcome_error(
+            code="forbidden",
+            diagnostics=f"The user does not have the rights to perform read operation.",
+        )
+    except OperationOutcome as ex:
+        logger.exception(
+            f"FHIR server returned an OperationOutcome error while reading the resource: '{type}', Caused by,",
+            exc_info=ex,
+        )
+        return ex.resource["issue"] or await get_operation_outcome_exception()
     except Exception as ex:
         logger.exception(
-            f"Error while executing the FHIR read interaction for resource_type '{type}'. Caused by, ",
+            f"An unexpected error occurred during the FHIR read operation for resource: '{type}'. Caused by, ",
             exc_info=ex,
         )
     return await get_operation_outcome_exception()
@@ -310,13 +348,14 @@ async def create(
                 and any server-added extensions). Reflects exactly what was persisted.
     """
 
-    logger.debug(
-        f"Invoked with type='{type}', payload={payload}, searchParam={searchParam}, and operation={operation}"
-    )
-
     try:
+        logger.debug(
+            f"Invoked with type='{type}', payload={payload}, searchParam={searchParam}, and operation={operation}"
+        )
         if not type:
-            logger.error("Unable to perform create: 'type' is a mandatory field.")
+            logger.error(
+                "Unable to perform create operation: 'type' is a mandatory field."
+            )
             return await get_operation_outcome_required_error("type")
 
         client: AsyncFHIRClient = await get_async_fhir_client()
@@ -325,14 +364,24 @@ async def create(
         )
 
         return await get_bundle_entries(bundle=bundle)
+    except ValueError as ex:
+        logger.exception(
+            f"User does not have permission to perform FHIR '{type}' resource create operation. Caused by, ",
+            exc_info=ex,
+        )
+        return await get_operation_outcome_error(
+            code="forbidden",
+            diagnostics=f"The user does not have the rights to perform create operation.",
+        )
     except OperationOutcome as ex:
         logger.exception(
-            f"Error while creating the FHIR resource:'{type}', Caused by,", exc_info=ex
+            f"FHIR server returned an OperationOutcome error while creating the resource: '{type}', Caused by,",
+            exc_info=ex,
         )
         return ex.resource["issue"] or await get_operation_outcome_exception()
     except Exception as ex:
         logger.exception(
-            f"Error while executing the FHIR create interaction for resource_type '{type}'. Caused by, ",
+            f"An unexpected error occurred during the FHIR create operation for resource: '{type}'. Caused by, ",
             exc_info=ex,
         )
     return await get_operation_outcome_exception()
@@ -370,13 +419,14 @@ async def update(
         Dict[str, Any]: A dictionary containing the updated FHIR resource after applying the JSON Patch operations..
     """
 
-    logger.debug(
-        f"Invoked with type='{type}', id={id}, payload={payload}, searchParam={searchParam}, and operation={operation}"
-    )
-
     try:
+        logger.debug(
+            f"Invoked with type='{type}', id={id}, payload={payload}, searchParam={searchParam}, and operation={operation}"
+        )
         if not type:
-            logger.error("Unable to perform create: 'type' is a mandatory field.")
+            logger.error(
+                "Unable to perform update operation: 'type' is a mandatory field."
+            )
             return await get_operation_outcome_required_error("type")
 
         client: AsyncFHIRClient = await get_async_fhir_client()
@@ -387,14 +437,24 @@ async def update(
             params=searchParam,
         )
         return await get_bundle_entries(bundle=bundle)
+    except ValueError as ex:
+        logger.exception(
+            f"User does not have permission to perform FHIR '{type}' resource update operation. Caused by, ",
+            exc_info=ex,
+        )
+        return await get_operation_outcome_error(
+            code="forbidden",
+            diagnostics=f"The user does not have the rights to perform update operation.",
+        )
     except OperationOutcome as ex:
         logger.exception(
-            f"Error while patching the FHIR resource:'{type}', Caused by,", exc_info=ex
+            f"FHIR server returned an OperationOutcome error while updating the resource: '{type}', Caused by,",
+            exc_info=ex,
         )
         return ex.resource["issue"] or await get_operation_outcome_exception()
     except Exception as ex:
         logger.exception(
-            f"Error while executing the FHIR patch interaction for resource_type '{type}'. Caused by, ",
+            f"An unexpected error occurred during the FHIR update operation for resource: '{type}'. Caused by, ",
             exc_info=ex,
         )
     return await get_operation_outcome_exception()
@@ -432,13 +492,14 @@ async def delete(
         Dict[str, Any]: A dictionary containing the confirmation of deletion or details on why deletion failed.
     """
 
-    logger.debug(
-        f"Invoked with type='{type}', id={id}, searchParam={searchParam}, and operation={operation}"
-    )
-
     try:
+        logger.debug(
+            f"Invoked with type='{type}', id={id}, searchParam={searchParam}, and operation={operation}"
+        )
         if not type:
-            logger.error("Unable to perform create: 'type' is a mandatory field.")
+            logger.error(
+                "Unable to perform delete operation: 'type' is a mandatory field."
+            )
             return await get_operation_outcome_required_error("type")
 
         client: AsyncFHIRClient = await get_async_fhir_client()
@@ -446,14 +507,24 @@ async def delete(
             operation=operation or "", method="DELETE", params=searchParam
         )
         return await get_bundle_entries(bundle=bundle)
+    except ValueError as ex:
+        logger.exception(
+            f"User does not have permission to perform FHIR '{type}' resource delete operation. Caused by, ",
+            exc_info=ex,
+        )
+        return await get_operation_outcome_error(
+            code="forbidden",
+            diagnostics=f"The user does not have the rights to perform delete operation.",
+        )
     except OperationOutcome as ex:
         logger.exception(
-            f"Error while deleting the FHIR resource:'{type}', Caused by,", exc_info=ex
+            f"FHIR server returned an OperationOutcome error while deleting the resource: '{type}', Caused by,",
+            exc_info=ex,
         )
         return ex.resource["issue"] or await get_operation_outcome_exception()
     except Exception as ex:
         logger.exception(
-            f"Error while executing the FHIR delete interaction for resource_type '{type}'. Caused by, ",
+            f"An unexpected error occurred during the FHIR delete operation for resource: '{type}'. Caused by, ",
             exc_info=ex,
         )
     return await get_operation_outcome_exception()

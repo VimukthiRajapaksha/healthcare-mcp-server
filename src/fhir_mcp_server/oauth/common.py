@@ -26,7 +26,7 @@ from typing import Dict
 from httpx import Response
 
 
-from oauth.types import OAuthMetadata, OAuthToken
+from fhir_mcp_server.oauth.types import OAuthMetadata, OAuthToken
 from mcp.shared._httpx_utils import create_mcp_http_client
 from starlette.responses import HTMLResponse
 

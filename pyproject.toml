@@ -1,10 +1,46 @@
 [project]
-name = "healthcare-mcp-server"
-version = "0.0.2"
+dependencies = [
+  "mcp[cli]>=1.9.1",
+  "aiohttp>=3.12.13"
+]
 description = "This server allows you to search for FHIR (Fast Healthcare Interoperability Resources) resources on a specified FHIR server."
+name = "fhir-mcp-server"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
-    "mcp[cli]>=1.9.1",
-    "requests>=2.32.3",
+version = "0.1.1"
+license = "Apache-2.0"
+license-files = ["LICEN[CS]E.*"]
+keywords = [
+    "fhir",
+    "healthcare",
+    "mcp",
+    "model-context-protocol",
+    "llm",
 ]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+]
+
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fhir_mcp_server"]
+
+[project.scripts]
+fhir-mcp-server = "fhir_mcp_server.server:main"
+
+[[tool.uv.index]]
+name = "pypi"
+publish-url = "https://upload.pypi.org/legacy/"
+url = "https://pypi.org/simple/"
+
+[project.urls]
+"Bug Tracker" = "https://github.com/VimukthiRajapaksha/healthcare-mcp-server/issues"
+"Documentation" = "https://github.com/VimukthiRajapaksha/healthcare-mcp-server/blob/development/README.md"
+"Homepage" = "https://github.com/VimukthiRajapaksha/healthcare-mcp-server"

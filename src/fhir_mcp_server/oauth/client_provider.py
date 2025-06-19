@@ -26,8 +26,8 @@ from typing import Dict
 from urllib.parse import urlencode
 from http.client import HTTPException
 from pydantic import AnyHttpUrl
-from oauth.types import FHIROAuthConfigs, OAuthMetadata, OAuthToken
-from oauth.common import (
+from fhir_mcp_server.oauth.types import FHIROAuthConfigs, OAuthMetadata, OAuthToken
+from fhir_mcp_server.oauth.common import (
     discover_oauth_metadata,
     is_token_expired,
     get_endpoint,

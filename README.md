@@ -44,6 +44,11 @@ uv run server.py
 ## VS Code Integration
 Add the following JSON block to your User Settings (JSON) file in VS Code. You can do this by pressing Ctrl + Shift + P and typing Preferences: Open User Settings (JSON).
 
+<table>
+<tr><th>Streamable HTTP</th><th>stdio</th></tr>
+<tr valign=top>
+<td>
+
 ```json
 "mcp": {
     "servers": {
@@ -58,6 +63,32 @@ Add the following JSON block to your User Settings (JSON) file in VS Code. You c
     }
 }
 ```
+</td>
+<td>
+
+```json
+"mcp": {
+    "servers": {
+        "fhir": {
+            "command": "uv",
+            "args": [
+                "--directory",
+                "/path/to/fhir-mcp-server",
+                "run",
+                "fhir-mcp-server",
+                "--transport",
+                "stdio"
+            ],
+            "env": {
+                "HEALTHCARE_MCP_FHIR__ACCESS_TOKEN": "Your FHIR Access Token"
+            }
+        }
+    }
+}
+```
+</td>
+</tr>
+</table>
 
 ## Claude Desktop Integration
 Add the following JSON block to your Claude Desktop settings to connect to your local MCP server. 
@@ -66,6 +97,11 @@ Add the following JSON block to your Claude Desktop settings to connect to your 
     - macOS: ~/Library/Application Support/Claude/claude_desktop_config.json
     - Windows: %APPDATA%\Claude\claude_desktop_config.json
  - Open the claude_desktop_config.json file in any text editor. Replace its contents with the following JSON block to register the MCP server:
+
+<table>
+<tr><th>Streamable HTTP</th><th>stdio</th></tr>
+<tr valign=top>
+<td>
 
 ```json
 {
@@ -81,7 +117,32 @@ Add the following JSON block to your Claude Desktop settings to connect to your 
     }
 }
 ```
+</td>
+<td>
 
+```json
+{
+    "mcpServers": {
+        "fhir": {
+            "command": "uv",
+            "args": [
+                "--directory",
+                "/path/to/fhir-mcp-server",
+                "run",
+                "fhir-mcp-server",
+                "--transport",
+                "stdio"
+            ],
+            "env": {
+                "HEALTHCARE_MCP_FHIR__ACCESS_TOKEN": "Your FHIR Access Token"
+            }
+        }
+    }
+}
+```
+</td>
+</tr>
+</table>
 
 ## MCP Inspector Integration
 Follow these steps to get the MCP Inspector up and running:
@@ -89,10 +150,24 @@ Follow these steps to get the MCP Inspector up and running:
 - Open a terminal and run the following command:
     
     `npx -y @modelcontextprotocol/inspector`
-    
+
 - In the MCP Inspector interface:
-    - Transport Type: Select Streamable HTTP
-    - URL: Enter http://localhost:8000/mcp
+<table>
+<tr><th>Streamable HTTP</th><th>stdio</th></tr>
+<tr valign=top>
+<td>
+
+- Transport Type: `Streamable HTTP`
+- URL: `http://localhost:8000/mcp`
+</td>
+<td>
+
+- Transport Type: `STDIO`
+- Command: `uv`
+- Arguments: `--directory /path/to/fhir-mcp-server run fhir-mcp-server --transport stdio`
+</td>
+</tr>
+</table>
 
 Make sure your MCP server is already running and listening on the above endpoint.
 

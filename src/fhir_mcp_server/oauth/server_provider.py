@@ -30,9 +30,13 @@ from mcp.server.auth.provider import (
     construct_redirect_uri,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
-from oauth.types import AuthorizationCode, OAuthMetadata, OAuthToken as OAuth2Token
-from oauth.types import OAuthMetadata, ServerConfigs
-from oauth.common import (
+from fhir_mcp_server.oauth.types import (
+    AuthorizationCode,
+    OAuthMetadata,
+    OAuthToken as OAuth2Token,
+)
+from fhir_mcp_server.oauth.types import OAuthMetadata, ServerConfigs
+from fhir_mcp_server.oauth.common import (
     discover_oauth_metadata,
     get_endpoint,
     generate_code_challenge,
@@ -99,7 +103,7 @@ class OAuthServerProvider(OAuthAuthorizationServerProvider):
             "scope": self.configs.oauth.scope,
             "client_id": self.configs.oauth.client_id,
             "redirect_uri": str(
-                self.configs.oauth.callback_url(self.configs.server_url)
+                self.configs.oauth.callback_url(self.configs.effective_server_url)
             ),
             "state": state,
             "code_challenge": code_challenge,
@@ -171,7 +175,7 @@ class OAuthServerProvider(OAuthAuthorizationServerProvider):
             "code_verifier": authorization_code.code_verifier,
             "client_id": self.configs.oauth.client_id,
             "client_secret": self.configs.oauth.client_secret,
-            "redirect_uri": self.configs.oauth.callback_url(self.configs.server_url),
+            "redirect_uri": self.configs.oauth.callback_url(self.configs.effective_server_url),
         }
 
         token: OAuth2Token = await perform_token_flow(

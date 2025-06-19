@@ -43,6 +43,7 @@ class MCPOAuthConfigs(BaseOAuthConfigs):
 class FHIROAuthConfigs(BaseOAuthConfigs):
     base_url: str
     timeout: int = 30  # in secs
+    access_token: str | None = None
 
     def callback_url(
         self, server_url: str, suffix: str = "/fhir/callback"
@@ -72,12 +73,15 @@ class ServerConfigs(BaseSettings):
     # Server settings
     host: str = "localhost"
     port: int = 8000
-    server_url: str = f"http://{host}:{port}"
-
+    server_url: str | None = None
     # OAuth2 settings
     oauth: MCPOAuthConfigs
-
+    # FHIR settings
     fhir: FHIROAuthConfigs
+
+    @property
+    def effective_server_url(self) -> str:
+        return self.server_url or f"http://{self.host}:{self.port}"
 
     def __init__(self, **data):
         """Initialize settings with values from environment variables"""

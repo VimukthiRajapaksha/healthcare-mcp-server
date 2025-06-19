@@ -17,11 +17,11 @@
 import aiohttp
 import logging
 
+from fhir_mcp_server.oauth import FHIROAuthConfigs
+
 from typing import Any, Dict, List, Optional
 from fhirpy import AsyncFHIRClient
-
 from mcp.shared._httpx_utils import create_mcp_http_client
-from oauth.types import FHIROAuthConfigs
 
 logger: logging.Logger = logging.getLogger(__name__)
 
